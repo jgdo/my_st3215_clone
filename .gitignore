@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+.pio
+.vscode/*
+.~lock.*
+ST3215 memory register map-EN.xls
+Communication_Protocol_Manual.pdf
+Bluepillpinout-4974006ee90b729a.gif
