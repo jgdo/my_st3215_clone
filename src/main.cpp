@@ -1,7 +1,12 @@
 #include <Arduino.h>
 
 long previousMillis = 0;
-volatile long encoderStepCount = 0;  // Global step count for quadrature encoder
+
+#define ENCODER_STEP_PER_UNIT 10
+
+volatile long encoderStepCount = 2048*ENCODER_STEP_PER_UNIT;  // Global step count for quadrature encoder
+
+#define USE_HALF_DUPLEX 1
 
 enum State
 {
@@ -57,11 +62,18 @@ enum State
 
 
 
-#define PIN_ENC_A A0
-#define PIN_ENC_B A1
-#define PIN_MOTOR_ENABLE A2
-#define PIN_MOTOR_IN1 A3
-#define PIN_MOTOR_IN2 A4
+#define PIN_ENC_A PB6
+#define PIN_ENC_B PB7
+
+#define PIN_MOTOR_IN1 PB8
+#define PIN_MOTOR_IN2 PB5
+#define PIN_MOTOR_EN PB9
+
+#define PIN_MANUAL_MODE_UP A1
+#define PIN_MANUAL_MODE_DOWN A0
+
+#define PIN_LIMIT_LOWER PA8
+#define PIN_LIMIT_UPPER PA9
 
 class ST3215Handler
 {
@@ -74,11 +86,21 @@ public:
         mMemoryTable[REG_SERVO_SUB_VERSION] = 3;
         mMemoryTable[REG_ID] = mMyId;
         mMemoryTable[REG_BAUD_RATE] = 1; // 500Kbps
+
+        mMemoryTable[REG_TARGET_POSITION_L] = 0;
+        mMemoryTable[REG_TARGET_POSITION_H] = 8;
     }
 
     void begin()
     {
-        Serial3.begin(500000);
+        #if USE_HALF_DUPLEX
+        Serial3.setHalfDuplex();
+        #endif
+        Serial3.begin(500000);;
+        // pinMode(PB10, INPUT);
+        #if USE_HALF_DUPLEX
+        Serial3.enableHalfDuplexRx();
+        #endif
     }
 
     bool handleCommunication()
@@ -88,7 +110,11 @@ public:
         while (Serial3.available())
         {
             const uint8_t byte = Serial3.read();
+            // Serial.printf("Received byte: 0x%02X\n", byte);
             handleByte(byte);
+            #if USE_HALF_DUPLEX
+            Serial3.enableHalfDuplexRx();
+            #endif
             received = true;
         }
         return received;
@@ -153,7 +179,7 @@ public:
     {
         if (mCctiveId != mMyId)
         {
-            Serial.printf("Ignoring command for ID 0x%02X\n", mCctiveId);
+            // Serial.printf("Ignoring command for ID 0x%02X\n", mCctiveId);
             return;
         }
 
@@ -322,60 +348,88 @@ void encoderInterrupt()
     // If they're in opposite states, we're moving in the other direction
     if (encA == encB)
     {
-        encoderStepCount--; 
+        encoderStepCount++; 
     }
     else
     {
-        encoderStepCount++;
+        encoderStepCount--;
     }
 }
 
+static int _lastMotorSpeed = -1000000000; // impossible initial value to ensure first update
+
 void setMotorSpeed(int speed)
 {
-    static int lastSpeed = -1000000000; // impossible initial value to ensure first update
-    if (speed == lastSpeed)
+    
+    if (speed == _lastMotorSpeed)
     {
         return;
     }
-    lastSpeed = speed;
+    _lastMotorSpeed = speed;
 
     Serial.printf("Setting motor speed to %d\n", speed);
+
+    if(speed > 0 && digitalRead(PIN_LIMIT_UPPER) == LOW) {
+        encoderStepCount = 4095*ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
+        speed = 0;
+    } else if (speed < 0 && digitalRead(PIN_LIMIT_LOWER) == LOW) {
+        encoderStepCount = 0; // reset to min position if lower limit is hit
+        speed = 0;
+    }
 
     if (speed > 0)
     {
         digitalWrite(PIN_MOTOR_IN1, HIGH);
         digitalWrite(PIN_MOTOR_IN2, LOW);
-        analogWrite(PIN_MOTOR_ENABLE, speed);
+        analogWrite(PIN_MOTOR_EN, speed);
     }
     else if (speed < 0)
     {
         digitalWrite(PIN_MOTOR_IN1, LOW);
         digitalWrite(PIN_MOTOR_IN2, HIGH);
-        analogWrite(PIN_MOTOR_ENABLE, -speed);
+        analogWrite(PIN_MOTOR_EN, -speed);
     }
     else
     {
         digitalWrite(PIN_MOTOR_IN1, LOW);
         digitalWrite(PIN_MOTOR_IN2, LOW);
-        analogWrite(PIN_MOTOR_ENABLE, 0);
+        analogWrite(PIN_MOTOR_EN, 0);
+    }
+}
+
+void checkMotorLimits()
+{
+    if (digitalRead(PIN_LIMIT_UPPER) == LOW) {
+        encoderStepCount = 4095*ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
+        if(_lastMotorSpeed > 0) {
+            setMotorSpeed(0);
+        }
+    }
+    else if (digitalRead(PIN_LIMIT_LOWER) == LOW) {
+        encoderStepCount = 0; // reset to min position if lower limit is hit
+        if(_lastMotorSpeed < 0) {
+            setMotorSpeed(0);
+        }
     }
 }
 
 class MotorController
 {
 public:
+    const int maxSpeed = 255;
+
     void begin()
     {
-        pinMode(PIN_MOTOR_ENABLE, OUTPUT);
         pinMode(PIN_MOTOR_IN1, OUTPUT);
         pinMode(PIN_MOTOR_IN2, OUTPUT);
+        pinMode(PIN_MOTOR_EN, OUTPUT);
         analogWriteResolution(8);
         setMotorSpeed(0);
     }
 
     void doLoop(int targetPosition)
     {
-        const int currentPosition = encoderStepCount / 10; // assuming 10 steps per unit
+        const int currentPosition = encoderStepCount / ENCODER_STEP_PER_UNIT;
         const int error = targetPosition - currentPosition;
 
         if(abs(error) < 20) {
@@ -388,17 +442,24 @@ public:
         int controlSignal = Kp * error;
 
         // Clamp control signal to motor speed limits
-        if (controlSignal > 255) {
-            controlSignal = 255;
+        if (controlSignal > maxSpeed) {
+            controlSignal = maxSpeed;
         }
-        else if (controlSignal < -255) {
-            controlSignal = -255;
+        else if (controlSignal < -maxSpeed) {
+            controlSignal = -maxSpeed;
         }
         else if (abs(controlSignal) < 50) {
             controlSignal = 0; // deadband
         }
 
         setMotorSpeed(controlSignal);
+    }
+
+    void applySetpointFromEncoder()
+    {
+        const int currentPosition = encoderStepCount / ENCODER_STEP_PER_UNIT;
+        st3215Handler.mMemoryTable[REG_TARGET_POSITION_H] = (currentPosition >> 8) & 0xFF;
+        st3215Handler.mMemoryTable[REG_TARGET_POSITION_L] = currentPosition & 0xFF;
     }
 };
 
@@ -419,6 +480,12 @@ void setup()
     pinMode(PIN_ENC_A, INPUT);
     pinMode(PIN_ENC_B, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderInterrupt, CHANGE);
+
+    pinMode(PIN_MANUAL_MODE_UP, INPUT_PULLUP);
+    pinMode(PIN_MANUAL_MODE_DOWN, INPUT_PULLUP);
+
+    pinMode(PIN_LIMIT_LOWER, INPUT_PULLUP);
+    pinMode(PIN_LIMIT_UPPER, INPUT_PULLUP);
 }
 
 void loop()
@@ -438,14 +505,23 @@ void loop()
     static int lastMs = 0;
     const auto setpointPos = st3215Handler.mMemoryTable[REG_TARGET_POSITION_L] | (st3215Handler.mMemoryTable[REG_TARGET_POSITION_H] << 8);
     static int lastSetpointPos = 0;
-    if (ms - lastMs >= 10 || setpointPos != lastSetpointPos) {
+
+    if (digitalRead(PIN_MANUAL_MODE_UP) == LOW) {
+        setMotorSpeed(200); // example speed for manual mode up
+        motor.applySetpointFromEncoder();
+    } else if (digitalRead(PIN_MANUAL_MODE_DOWN) == LOW) {
+        setMotorSpeed(-200); // example speed for manual mode down
+        motor.applySetpointFromEncoder();
+    } else if (ms - lastMs >= 10 || setpointPos != lastSetpointPos) {
         lastMs = ms;
         lastSetpointPos = setpointPos;
 
         motor.doLoop(setpointPos);
     }
 
-    const int step = encoderStepCount / 10;
+    checkMotorLimits();
+
+    const int step = encoderStepCount / ENCODER_STEP_PER_UNIT;
     st3215Handler.mMemoryTable[REG_POSITION_H] = (step >> 8) & 0xFF; // example current position high byte
     st3215Handler.mMemoryTable[REG_POSITION_L] = step & 0xFF;        // example current position low byte
 }
