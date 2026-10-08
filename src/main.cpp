@@ -2,12 +2,47 @@
 #include <SoftFram.h>
 #include <SoftWire.h>
 #include <atomic>
+#include <cstring>
 
 long previousMillis = 0;
 
 #define ENCODER_STEP_PER_UNIT 10
 
-std::atomic<long> encoderStepCount = 2048*ENCODER_STEP_PER_UNIT;  // Global step count for quadrature encoder
+std::atomic<int32_t> encoderStepCount = 2048*ENCODER_STEP_PER_UNIT;  // Global step count for quadrature encoder
+int32_t framEncoderStepCount = 0;
+bool framAvailable = false;
+bool framEncoderStepCountValid = false;
+bool framWriteErrorReported = false;
+
+constexpr uint8_t CRC8_POLYNOMIAL = 0x07;
+
+uint8_t crc8(const uint8_t *data, size_t length)
+{
+    uint8_t checksum = 0;
+    for (size_t i = 0; i < length; ++i)
+    {
+        checksum ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit)
+        {
+            checksum = (checksum & 0x80) ? static_cast<uint8_t>((checksum << 1) ^ CRC8_POLYNOMIAL)
+                                         : static_cast<uint8_t>(checksum << 1);
+        }
+    }
+    return checksum;
+}
+
+void encodeEncoderStepCount(int32_t value, uint8_t *record)
+{
+    std::memcpy(record, &value, sizeof(value));
+    record[sizeof(value)] = crc8(record, sizeof(value));
+}
+
+int32_t decodeEncoderStepCount(const uint8_t *record)
+{
+    int32_t value;
+    std::memcpy(&value, record, sizeof(value));
+    return value;
+}
 
 #define USE_HALF_DUPLEX 1
 
@@ -474,12 +509,8 @@ public:
 
 MotorController motor;
 
-void setup()
+void initializeFram()
 {
-    delay(2000);
-    pinMode(LED_BUILTIN, OUTPUT);
-    Serial.begin(1000000);
-
     framWire.setRxBuffer(framRxBuf, sizeof(framRxBuf));
     framWire.setTxBuffer(framTxBuf, sizeof(framTxBuf));
     framWire.setDelay_us(5);
@@ -491,7 +522,73 @@ void setup()
     {
         Serial.printf("FRAM initialization failed: %d\n", fram.lastError());
     }
-    Serial.printf("FRAM size: %lu bytes\n", static_cast<unsigned long>(fram.getSizeBytes()));
+    else
+    {
+        framAvailable = true;
+        Serial.printf("FRAM size: %lu bytes\n", static_cast<unsigned long>(fram.getSizeBytes()));
+
+        uint8_t framRecord[sizeof(int32_t) + 1];
+        fram.read(0, framRecord, sizeof(framRecord));
+        const int framReadError = fram.lastError();
+        if (framReadError != FRAM_OK)
+        {
+            Serial.printf("FRAM encoder step count read failed: %d\n", framReadError);
+        }
+        else if (crc8(framRecord, sizeof(int32_t)) == framRecord[sizeof(int32_t)])
+        {
+            const int32_t storedStepCount = decodeEncoderStepCount(framRecord);
+            encoderStepCount.store(storedStepCount);
+            framEncoderStepCount = storedStepCount;
+            framEncoderStepCountValid = true;
+            Serial.printf("FRAM encoder step count loaded: %ld\n", static_cast<long>(storedStepCount));
+        }
+        else
+        {
+            Serial.println("FRAM encoder step count checksum mismatch. Using default step count value.");
+        }
+    }
+}
+
+void saveEncoderStepCountToFram()
+{
+    if (!framAvailable)
+    {
+        return;
+    }
+
+    const int32_t currentStepCount = encoderStepCount.load();
+    if (framEncoderStepCountValid && framEncoderStepCount == currentStepCount)
+    {
+        return;
+    }
+
+    uint8_t framRecord[sizeof(int32_t) + 1];
+    encodeEncoderStepCount(currentStepCount, framRecord);
+    fram.write(0, framRecord, sizeof(framRecord));
+    const int framWriteError = fram.lastError();
+    if (framWriteError != FRAM_OK)
+    {
+        if (!framWriteErrorReported)
+        {
+            Serial.printf("FRAM encoder step count write failed: %d\n", framWriteError);
+            framWriteErrorReported = true;
+        }
+    }
+    else
+    {
+        framEncoderStepCount = currentStepCount;
+        framEncoderStepCountValid = true;
+        framWriteErrorReported = false;
+    }
+}
+
+void setup()
+{
+    delay(2000);
+    pinMode(LED_BUILTIN, OUTPUT);
+    Serial.begin(1000000);
+
+    initializeFram();
 
     st3215Handler.begin();
 
@@ -549,4 +646,6 @@ void loop()
     const int step = encoderStepCount / ENCODER_STEP_PER_UNIT;
     st3215Handler.mMemoryTable[REG_POSITION_H] = (step >> 8) & 0xFF; // example current position high byte
     st3215Handler.mMemoryTable[REG_POSITION_L] = step & 0xFF;        // example current position low byte
+
+    saveEncoderStepCountToFram();
 }

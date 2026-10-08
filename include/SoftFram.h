@@ -6,6 +6,8 @@
 //    DATE: 2018-01-24
 // PURPOSE: Arduino library for I2C FRAM
 //     URL: https://github.com/RobTillaart/FRAM_I2C
+//
+// Ported to SoftWire (Software I2C)
 
 
 #include <Arduino.h>
