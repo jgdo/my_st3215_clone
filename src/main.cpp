@@ -1,10 +1,13 @@
 #include <Arduino.h>
+#include <SoftFram.h>
+#include <SoftWire.h>
+#include <atomic>
 
 long previousMillis = 0;
 
 #define ENCODER_STEP_PER_UNIT 10
 
-volatile long encoderStepCount = 2048*ENCODER_STEP_PER_UNIT;  // Global step count for quadrature encoder
+std::atomic<long> encoderStepCount = 2048*ENCODER_STEP_PER_UNIT;  // Global step count for quadrature encoder
 
 #define USE_HALF_DUPLEX 1
 
@@ -74,6 +77,9 @@ enum State
 
 #define PIN_LIMIT_LOWER PA8
 #define PIN_LIMIT_UPPER PA9
+
+#define PIN_FRAM_SDA PB1
+#define PIN_FRAM_SCL PB0
 
 class ST3215Handler
 {
@@ -335,6 +341,9 @@ public:
 };
 
 ST3215Handler st3215Handler;
+uint8_t framRxBuf[64], framTxBuf[64];
+SoftWire framWire{PIN_FRAM_SDA, PIN_FRAM_SCL};
+SoftFRAM fram{&framWire};
 
 // Interrupt handler for quadrature encoder on PIN_ENC_A
 void encoderInterrupt()
@@ -467,8 +476,23 @@ MotorController motor;
 
 void setup()
 {
+    delay(2000);
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(1000000);
+
+    framWire.setRxBuffer(framRxBuf, sizeof(framRxBuf));
+    framWire.setTxBuffer(framTxBuf, sizeof(framTxBuf));
+    framWire.setDelay_us(5);
+    framWire.setTimeout(40);
+    framWire.begin();
+
+    const int framInitResult = fram.begin();
+    if (framInitResult != FRAM_OK)
+    {
+        Serial.printf("FRAM initialization failed: %d\n", fram.lastError());
+    }
+    Serial.printf("FRAM size: %lu bytes\n", static_cast<unsigned long>(fram.getSizeBytes()));
+
     st3215Handler.begin();
 
     Serial.println("Setup complete.");
@@ -499,6 +523,7 @@ void loop()
     {
         previousMillis = millis();
         Serial.println("No command received in the past.");
+        // Serial.printf("FRAM size: %lu bytes\n", static_cast<unsigned long>(fram.getSizeBytes()));
     }
 
     const auto ms = millis();
