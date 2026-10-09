@@ -6,9 +6,11 @@
 
 long previousMillis = 0;
 
+#define THIS_STS_SERVO_ID 0x01
+
 #define ENCODER_STEP_PER_UNIT 10
 
-std::atomic<int32_t> encoderStepCount = 2048*ENCODER_STEP_PER_UNIT;  // Global step count for quadrature encoder
+std::atomic<int32_t> encoderStepCount = 2048 * ENCODER_STEP_PER_UNIT; // Global step count for quadrature encoder
 int32_t framEncoderStepCount = 0;
 bool framAvailable = false;
 bool framEncoderStepCountValid = false;
@@ -44,8 +46,6 @@ int32_t decodeEncoderStepCount(const uint8_t *record)
     return value;
 }
 
-#define USE_HALF_DUPLEX 1
-
 enum State
 {
     WAITING_FIRST_FF,
@@ -53,7 +53,16 @@ enum State
     WAITING_ID,
     WAITING_LENGTH,
     RECEIVING_PAYLOAD,
+    WAIT_FOR_READ_SYNC_TRANSMISSION_TIME,
 };
+
+#define INST_PING 0x01
+#define INST_READ 0x02
+#define INST_WRITE 0x03
+#define INST_REG_WRITE 0x04
+#define INST_REG_ACTION 0x05
+#define INST_SYNC_READ 0x82
+#define INST_SYNC_WRITE 0x83
 
 #define REG_FIRMWARE_MAIN_VERSION 0
 #define REG_FIRMWARE_SUB_VERSION 1
@@ -98,8 +107,6 @@ enum State
 #define REG_CURRENT_L 0x45
 #define REG_CURRENT_H 0x46
 
-
-
 #define PIN_ENC_A PB6
 #define PIN_ENC_B PB7
 
@@ -134,40 +141,66 @@ public:
 
     void begin()
     {
-        #if USE_HALF_DUPLEX
         Serial3.setHalfDuplex();
-        #endif
-        Serial3.begin(500000);;
-        // pinMode(PB10, INPUT);
-        #if USE_HALF_DUPLEX
+        Serial3.begin(500000);
         Serial3.enableHalfDuplexRx();
-        #endif
+    }
+
+    bool handleReadSyncTransmission()
+    {
+        if (state != WAIT_FOR_READ_SYNC_TRANSMISSION_TIME)
+        {
+            return false;
+        }
+
+        // discard all bytes received in between
+        while (Serial3.available())
+        {
+            Serial3.read();
+        }
+
+        const auto elapsed = micros() - mReadSyncTransmissionTime_us;
+        if (elapsed < mReadSyncTransmissionDelay_us)
+        {
+            return true;
+        }
+
+        tx(mSyncReadResponseBuffer, mSyncReadResponseLength);
+        state = WAITING_FIRST_FF;
+        return true;
     }
 
     bool handleCommunication()
     {
         bool received = false;
 
-        while (Serial3.available())
+        if (handleReadSyncTransmission())
+        {
+            return true;
+        }
+
+        while (Serial3.available() && state != WAIT_FOR_READ_SYNC_TRANSMISSION_TIME)
         {
             const uint8_t byte = Serial3.read();
             // Serial.printf("Received byte: 0x%02X\n", byte);
             handleByte(byte);
-            #if USE_HALF_DUPLEX
-            Serial3.enableHalfDuplexRx();
-            #endif
             received = true;
         }
         return received;
     }
 
     // private:
-    int mMyId = 0x01;
+    int mMyId = THIS_STS_SERVO_ID;
     State state = WAITING_FIRST_FF;
-    int mCctiveId = -1;
+    int mActiveId = -1;
     int mPayloadLength = 0;
     int payloadIndex = 0;
-    uint8_t payload[256];
+    uint8_t payload[256]; // [0] is instruction, [1] is length, [2...] is data
+
+    uint8_t mSyncReadResponseBuffer[256];
+    int mSyncReadResponseLength = 0;
+    uint32_t mReadSyncTransmissionDelay_us = 0;
+    uint32_t mReadSyncTransmissionTime_us = 0;
 
     void handleByte(uint8_t byte)
     {
@@ -192,7 +225,7 @@ public:
         case WAITING_ID:
             if (byte != 0XFF)
             {
-                mCctiveId = byte;
+                mActiveId = byte;
                 state = WAITING_LENGTH;
             }
             else
@@ -210,7 +243,10 @@ public:
             if (payloadIndex >= mPayloadLength)
             {
                 checkCommand();
-                state = WAITING_FIRST_FF;
+                if (state != WAIT_FOR_READ_SYNC_TRANSMISSION_TIME)
+                {
+                    state = WAITING_FIRST_FF;
+                }
             }
             break;
         }
@@ -218,7 +254,7 @@ public:
 
     void checkCommand()
     {
-        if (mCctiveId != mMyId)
+        if (mActiveId != mMyId && mActiveId != 0xFE)
         {
             // Serial.printf("Ignoring command for ID 0x%02X\n", mCctiveId);
             return;
@@ -248,15 +284,19 @@ public:
 
         switch (payload[0])
         {
-        case 0x01: // ping
+        case INST_PING:
             handlePing();
             break;
-        case 0x02: // read
+        case INST_READ:
             handleRead();
             break;
-        case 0x03: // write
+        case INST_WRITE:
             handleWrite();
             break;
+        case INST_SYNC_READ: // sync read
+            handleSyncRead();
+            break;
+
         default:
             Serial.printf("Unknown command: 0x%02X\n", payload[0]);
         }
@@ -274,7 +314,7 @@ public:
 
     void tx(const uint8_t *payload, size_t length)
     {
-        uint8_t rawData[length + 7];
+        uint8_t rawData[length + 6];
         rawData[0] = 0xFF;
         rawData[1] = 0xFF;
         rawData[2] = mMyId;
@@ -290,6 +330,8 @@ public:
         rawData[length + 5] = checksum;
 
         Serial3.write(rawData, length + 6);
+        Serial3.flush();
+        Serial3.enableHalfDuplexRx();
 
         // Serial.print("sent: ");
         // for (int i = 0; i < length + 6; ++i)
@@ -320,12 +362,6 @@ public:
             return;
         }
 
-        if (num > 4)
-        {
-            Serial.println("Read request too large.");
-            return;
-        }
-
         if (addr + num > mMemoryTable.size())
         {
             Serial.println("Read request out of bounds.");
@@ -351,12 +387,12 @@ public:
         const size_t addr = payload[1];
         const size_t num = mPayloadLength - 3; // 3 = write command + addr + checksum
 
-        Serial.printf("Write request to addr 0x%02X with %d bytes\n", addr, num);
-        for (int i = 0; i < num; ++i)
-        {
-            Serial.printf("0x%02X ", payload[i + 2]);
-        }
-        Serial.println();
+        // Serial.printf("Write request to addr 0x%02X with %d bytes\n", addr, num);
+        // for (int i = 0; i < num; ++i)
+        // {
+        //     Serial.printf("0x%02X ", payload[i + 2]);
+        // }
+        // Serial.println();
 
         if (addr + num > mMemoryTable.size())
         {
@@ -370,6 +406,58 @@ public:
         }
 
         tx();
+    }
+
+    void handleSyncRead()
+    {
+        const size_t addr = payload[1];
+        const size_t numReadBytes = payload[2];
+        const size_t numServos = mPayloadLength - 4;
+
+        int my_servo_position = -1;
+
+        for (size_t i = 0; i < numServos; ++i)
+        {
+            const size_t servo_id = payload[3 + i];
+            if (servo_id == mMyId)
+            {
+                my_servo_position = i;
+                // Handle reading from this servo as needed
+                break;
+            }
+        }
+
+        if (my_servo_position == -1)
+        {
+            Serial.println("Sync read request does not include this servo.");
+            return;
+        }
+
+        if (numReadBytes == 0)
+        {
+            Serial.println("Read request with zero length.");
+            return;
+        }
+
+        if (addr + numReadBytes > mMemoryTable.size())
+        {
+            Serial.println("Read request out of bounds.");
+            return;
+        }
+
+        for (size_t i = 0; i < numReadBytes; ++i)
+        {
+            mSyncReadResponseBuffer[i] = mMemoryTable[addr + i];
+        }
+        mSyncReadResponseLength = numReadBytes;
+
+        const float byteDelayS = (1.0f / 500000) * 10;               // 10 bits per byte
+        const float packageDelayS = byteDelayS * (numReadBytes + 9); // 6 bytes from protocol, and a implementation i found online additionally adds 3 bytes of delay
+        mReadSyncTransmissionDelay_us = static_cast<uint32_t>(packageDelayS * my_servo_position * 1000000);
+        mReadSyncTransmissionTime_us = micros();
+        state = WAIT_FOR_READ_SYNC_TRANSMISSION_TIME;
+
+        // Serial.printf("Sync read of %d bytes, own id at position %d, transmission delay will be: %u us, state: %d\n", numReadBytes, my_servo_position, mReadSyncTransmissionDelay_us, state);
     }
 
     std::array<uint8_t, 71> mMemoryTable;
@@ -386,13 +474,13 @@ void encoderInterrupt()
     // Read the current state of both encoder pins
     const bool encA = digitalRead(PIN_ENC_A);
     const bool encB = digitalRead(PIN_ENC_B);
-    
+
     // Determine direction based on the quadrature pattern
     // If A and B are in the same state, we're moving in one direction
     // If they're in opposite states, we're moving in the other direction
     if (encA == encB)
     {
-        encoderStepCount++; 
+        encoderStepCount++;
     }
     else
     {
@@ -404,19 +492,22 @@ static int _lastMotorSpeed = -1000000000; // impossible initial value to ensure 
 
 void setMotorSpeed(int speed)
 {
-    
+
     if (speed == _lastMotorSpeed)
     {
         return;
     }
     _lastMotorSpeed = speed;
 
-    Serial.printf("Setting motor speed to %d\n", speed);
+    // Serial.printf("Setting motor speed to %d\n", speed);
 
-    if(speed > 0 && digitalRead(PIN_LIMIT_UPPER) == LOW) {
-        encoderStepCount = 4095*ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
+    if (speed > 0 && digitalRead(PIN_LIMIT_UPPER) == LOW)
+    {
+        encoderStepCount = 4095 * ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
         speed = 0;
-    } else if (speed < 0 && digitalRead(PIN_LIMIT_LOWER) == LOW) {
+    }
+    else if (speed < 0 && digitalRead(PIN_LIMIT_LOWER) == LOW)
+    {
         encoderStepCount = 0; // reset to min position if lower limit is hit
         speed = 0;
     }
@@ -443,15 +534,19 @@ void setMotorSpeed(int speed)
 
 void checkMotorLimits()
 {
-    if (digitalRead(PIN_LIMIT_UPPER) == LOW) {
-        encoderStepCount = 4095*ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
-        if(_lastMotorSpeed > 0) {
+    if (digitalRead(PIN_LIMIT_UPPER) == LOW)
+    {
+        encoderStepCount = 4095 * ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
+        if (_lastMotorSpeed > 0)
+        {
             setMotorSpeed(0);
         }
     }
-    else if (digitalRead(PIN_LIMIT_LOWER) == LOW) {
+    else if (digitalRead(PIN_LIMIT_LOWER) == LOW)
+    {
         encoderStepCount = 0; // reset to min position if lower limit is hit
-        if(_lastMotorSpeed < 0) {
+        if (_lastMotorSpeed < 0)
+        {
             setMotorSpeed(0);
         }
     }
@@ -476,7 +571,8 @@ public:
         const int currentPosition = encoderStepCount / ENCODER_STEP_PER_UNIT;
         const int error = targetPosition - currentPosition;
 
-        if(abs(error) < 20) {
+        if (abs(error) < 20)
+        {
             setMotorSpeed(0);
             return; // within deadband
         }
@@ -486,13 +582,16 @@ public:
         int controlSignal = Kp * error;
 
         // Clamp control signal to motor speed limits
-        if (controlSignal > maxSpeed) {
+        if (controlSignal > maxSpeed)
+        {
             controlSignal = maxSpeed;
         }
-        else if (controlSignal < -maxSpeed) {
+        else if (controlSignal < -maxSpeed)
+        {
             controlSignal = -maxSpeed;
         }
-        else if (abs(controlSignal) < 50) {
+        else if (abs(controlSignal) < 50)
+        {
             controlSignal = 0; // deadband
         }
 
@@ -540,6 +639,7 @@ void initializeFram()
             encoderStepCount.store(storedStepCount);
             framEncoderStepCount = storedStepCount;
             framEncoderStepCountValid = true;
+            motor.applySetpointFromEncoder();
             Serial.printf("FRAM encoder step count loaded: %ld\n", static_cast<long>(storedStepCount));
         }
         else
@@ -588,15 +688,13 @@ void setup()
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(1000000);
 
-    initializeFram();
-
     st3215Handler.begin();
 
-    Serial.println("Setup complete.");
     previousMillis = millis();
 
     motor.begin();
-    
+    initializeFram();
+
     // Setup quadrature encoder pins and interrupt
     pinMode(PIN_ENC_A, INPUT);
     pinMode(PIN_ENC_B, INPUT);
@@ -607,6 +705,8 @@ void setup()
 
     pinMode(PIN_LIMIT_LOWER, INPUT_PULLUP);
     pinMode(PIN_LIMIT_UPPER, INPUT_PULLUP);
+
+    Serial.println("Setup complete.");
 }
 
 void loop()
@@ -619,7 +719,7 @@ void loop()
     else if (millis() - previousMillis >= 5000)
     {
         previousMillis = millis();
-        Serial.println("No command received in the past.");
+        Serial.printf("No command received in the past. State is %d\n", st3215Handler.state);
         // Serial.printf("FRAM size: %lu bytes\n", static_cast<unsigned long>(fram.getSizeBytes()));
     }
 
@@ -628,13 +728,18 @@ void loop()
     const auto setpointPos = st3215Handler.mMemoryTable[REG_TARGET_POSITION_L] | (st3215Handler.mMemoryTable[REG_TARGET_POSITION_H] << 8);
     static int lastSetpointPos = 0;
 
-    if (digitalRead(PIN_MANUAL_MODE_UP) == LOW) {
+    if (digitalRead(PIN_MANUAL_MODE_UP) == LOW)
+    {
         setMotorSpeed(200); // example speed for manual mode up
         motor.applySetpointFromEncoder();
-    } else if (digitalRead(PIN_MANUAL_MODE_DOWN) == LOW) {
+    }
+    else if (digitalRead(PIN_MANUAL_MODE_DOWN) == LOW)
+    {
         setMotorSpeed(-200); // example speed for manual mode down
         motor.applySetpointFromEncoder();
-    } else if (ms - lastMs >= 10 || setpointPos != lastSetpointPos) {
+    }
+    else if (ms - lastMs >= 10 || setpointPos != lastSetpointPos)
+    {
         lastMs = ms;
         lastSetpointPos = setpointPos;
 
