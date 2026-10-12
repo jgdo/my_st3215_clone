@@ -8,7 +8,10 @@ long previousMillis = 0;
 
 #define THIS_STS_SERVO_ID 0x01
 
-#define ENCODER_STEP_PER_UNIT 10
+#define MIN_PHYSICAL_POSITION 0
+#define MAX_PHYSICAL_POSITION 3730
+
+#define ENCODER_STEP_PER_UNIT 12
 
 std::atomic<int32_t> encoderStepCount = 2048 * ENCODER_STEP_PER_UNIT; // Global step count for quadrature encoder
 int32_t framEncoderStepCount = 0;
@@ -117,8 +120,8 @@ enum State
 #define PIN_MANUAL_MODE_UP A1
 #define PIN_MANUAL_MODE_DOWN A0
 
-#define PIN_LIMIT_LOWER PA8
-#define PIN_LIMIT_UPPER PA9
+#define PIN_LIMIT_LOWER PA9
+#define PIN_LIMIT_UPPER PA8
 
 #define PIN_FRAM_SDA PB1
 #define PIN_FRAM_SCL PB0
@@ -480,11 +483,11 @@ void encoderInterrupt()
     // If they're in opposite states, we're moving in the other direction
     if (encA == encB)
     {
-        encoderStepCount++;
+        encoderStepCount--;
     }
     else
     {
-        encoderStepCount--;
+        encoderStepCount++;
     }
 }
 
@@ -503,25 +506,25 @@ void setMotorSpeed(int speed)
 
     if (speed > 0 && digitalRead(PIN_LIMIT_UPPER) == LOW)
     {
-        encoderStepCount = 4095 * ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
+        encoderStepCount = MAX_PHYSICAL_POSITION * ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
         speed = 0;
     }
     else if (speed < 0 && digitalRead(PIN_LIMIT_LOWER) == LOW)
     {
-        encoderStepCount = 0; // reset to min position if lower limit is hit
+        encoderStepCount = MIN_PHYSICAL_POSITION * ENCODER_STEP_PER_UNIT; // reset to min position if lower limit is hit
         speed = 0;
     }
 
     if (speed > 0)
     {
-        digitalWrite(PIN_MOTOR_IN1, HIGH);
-        digitalWrite(PIN_MOTOR_IN2, LOW);
+        digitalWrite(PIN_MOTOR_IN1, LOW);
+        digitalWrite(PIN_MOTOR_IN2, HIGH);
         analogWrite(PIN_MOTOR_EN, speed);
     }
     else if (speed < 0)
     {
-        digitalWrite(PIN_MOTOR_IN1, LOW);
-        digitalWrite(PIN_MOTOR_IN2, HIGH);
+        digitalWrite(PIN_MOTOR_IN1, HIGH);
+        digitalWrite(PIN_MOTOR_IN2, LOW);
         analogWrite(PIN_MOTOR_EN, -speed);
     }
     else
@@ -536,7 +539,7 @@ void checkMotorLimits()
 {
     if (digitalRead(PIN_LIMIT_UPPER) == LOW)
     {
-        encoderStepCount = 4095 * ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
+        encoderStepCount = MAX_PHYSICAL_POSITION * ENCODER_STEP_PER_UNIT; // reset to max position if upper limit is hit
         if (_lastMotorSpeed > 0)
         {
             setMotorSpeed(0);
@@ -544,7 +547,7 @@ void checkMotorLimits()
     }
     else if (digitalRead(PIN_LIMIT_LOWER) == LOW)
     {
-        encoderStepCount = 0; // reset to min position if lower limit is hit
+        encoderStepCount = MIN_PHYSICAL_POSITION * ENCODER_STEP_PER_UNIT; // reset to min position if lower limit is hit
         if (_lastMotorSpeed < 0)
         {
             setMotorSpeed(0);
@@ -725,17 +728,18 @@ void loop()
 
     const auto ms = millis();
     static int lastMs = 0;
-    const auto setpointPos = st3215Handler.mMemoryTable[REG_TARGET_POSITION_L] | (st3215Handler.mMemoryTable[REG_TARGET_POSITION_H] << 8);
+    const auto setpointPosRaw = st3215Handler.mMemoryTable[REG_TARGET_POSITION_L] | (st3215Handler.mMemoryTable[REG_TARGET_POSITION_H] << 8);
+    const auto setpointPos = constrain(setpointPosRaw, MIN_PHYSICAL_POSITION, MAX_PHYSICAL_POSITION);
     static int lastSetpointPos = 0;
 
     if (digitalRead(PIN_MANUAL_MODE_UP) == LOW)
     {
-        setMotorSpeed(200); // example speed for manual mode up
+        setMotorSpeed(-200);
         motor.applySetpointFromEncoder();
     }
     else if (digitalRead(PIN_MANUAL_MODE_DOWN) == LOW)
     {
-        setMotorSpeed(-200); // example speed for manual mode down
+        setMotorSpeed(200);
         motor.applySetpointFromEncoder();
     }
     else if (ms - lastMs >= 10 || setpointPos != lastSetpointPos)
@@ -748,9 +752,9 @@ void loop()
 
     checkMotorLimits();
 
-    const int step = encoderStepCount / ENCODER_STEP_PER_UNIT;
-    st3215Handler.mMemoryTable[REG_POSITION_H] = (step >> 8) & 0xFF; // example current position high byte
-    st3215Handler.mMemoryTable[REG_POSITION_L] = step & 0xFF;        // example current position low byte
+    const uint16_t step = constrain(encoderStepCount / ENCODER_STEP_PER_UNIT, MIN_PHYSICAL_POSITION, MAX_PHYSICAL_POSITION);
+    st3215Handler.mMemoryTable[REG_POSITION_H] = (step >> 8) & 0xFF;
+    st3215Handler.mMemoryTable[REG_POSITION_L] = step & 0xFF;
 
     saveEncoderStepCountToFram();
 }
