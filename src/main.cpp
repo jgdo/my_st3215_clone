@@ -1,12 +1,13 @@
 #include <Arduino.h>
 #include <SoftFram.h>
 #include <SoftWire.h>
+#include <EEPROM.h>
 #include <atomic>
 #include <cstring>
 
 long previousMillis = 0;
 
-#define THIS_STS_SERVO_ID 0x01
+#define INITIAL_SERVO_ID 0x01
 
 #define MIN_PHYSICAL_POSITION 0
 #define MAX_PHYSICAL_POSITION 3730
@@ -23,7 +24,7 @@ constexpr uint8_t CRC8_POLYNOMIAL = 0x07;
 
 uint8_t crc8(const uint8_t *data, size_t length)
 {
-    uint8_t checksum = 0;
+    uint8_t checksum = 0xFF;
     for (size_t i = 0; i < length; ++i)
     {
         checksum ^= data[i];
@@ -98,6 +99,8 @@ enum State
 #define REG_OPERATION_SPEED_L 0x2E
 #define REG_OPERATION_SPEED_H 0x2F
 
+#define REG_LOCK 0x37
+
 #define REG_POSITION_L 0x38
 #define REG_POSITION_H 0x39
 #define REG_SPEED_L 0x3A
@@ -128,18 +131,30 @@ enum State
 
 class ST3215Handler
 {
+    static constexpr size_t FIRST_EEPROM_REG = 5;
+    static constexpr size_t LAST_EEPROM_REG = 39;
+    static constexpr size_t EEPROM_REG_COUNT = LAST_EEPROM_REG - FIRST_EEPROM_REG + 1;
+    static constexpr uint32_t EEPROM_CRC_ADDR = 0; 
+    static_assert(FIRST_EEPROM_REG > 0, "FIRST_EEPROM_REG must not start at 0 because EEPROM_CRC_ADDR is at 0");
 public:
     ST3215Handler()
     {
+        // Hardcoded values
         mMemoryTable[REG_FIRMWARE_MAIN_VERSION] = 3;
         mMemoryTable[REG_FIRMWARE_SUB_VERSION] = 6;
         mMemoryTable[REG_SERVO_MAIN_VERSION] = 9;
         mMemoryTable[REG_SERVO_SUB_VERSION] = 3;
-        mMemoryTable[REG_ID] = mMyId;
+        mMemoryTable[REG_ID] = INITIAL_SERVO_ID;
+        
+        // EEPROM default values
         mMemoryTable[REG_BAUD_RATE] = 1; // 500Kbps
+        mMemoryTable[REG_LOCK] = 1;
 
+        // will be set to current position later
         mMemoryTable[REG_TARGET_POSITION_L] = 0;
         mMemoryTable[REG_TARGET_POSITION_H] = 8;
+
+        loadEEPROM();
     }
 
     void begin()
@@ -192,8 +207,55 @@ public:
         return received;
     }
 
+    void writeEEPROM()
+    {
+        eeprom_buffer_fill(); // load current flash contents so untouched bytes are preserved
+
+        bool changed = false;
+
+        for (size_t reg = FIRST_EEPROM_REG; reg <= LAST_EEPROM_REG; ++reg)
+        {
+            if (eeprom_buffered_read_byte(reg) != mMemoryTable[reg])
+            {
+                eeprom_buffered_write_byte(reg, mMemoryTable[reg]);
+                changed = true;
+            }
+        }
+
+        const uint8_t checksum = crc8(mMemoryTable.data() + FIRST_EEPROM_REG, EEPROM_REG_COUNT);
+        if (eeprom_buffered_read_byte(EEPROM_CRC_ADDR) != checksum)
+        {
+            eeprom_buffered_write_byte(EEPROM_CRC_ADDR, checksum);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            eeprom_buffer_flush();
+            Serial.println("Written memory to EEPROM");
+        }
+    }
+
+    void loadEEPROM()
+    {
+        eeprom_buffer_fill();
+
+        uint8_t stored[EEPROM_REG_COUNT];
+        for (size_t i = 0; i < EEPROM_REG_COUNT; ++i)
+        {
+            stored[i] = eeprom_buffered_read_byte(FIRST_EEPROM_REG + i);
+        }
+        if (crc8(stored, EEPROM_REG_COUNT) != eeprom_buffered_read_byte(EEPROM_CRC_ADDR))
+        {
+            Serial.println("Invalid EEPROM CRC, keeping defaults.");
+            return; // no valid data stored yet, keep defaults
+        }
+
+        std::memcpy(&mMemoryTable[FIRST_EEPROM_REG], stored, EEPROM_REG_COUNT);
+        Serial.println("Loaded EEPROM values successfully.");
+    }
+
     // private:
-    int mMyId = THIS_STS_SERVO_ID;
     State state = WAITING_FIRST_FF;
     int mActiveId = -1;
     int mPayloadLength = 0;
@@ -204,6 +266,10 @@ public:
     int mSyncReadResponseLength = 0;
     uint32_t mReadSyncTransmissionDelay_us = 0;
     uint32_t mReadSyncTransmissionTime_us = 0;
+
+    auto myID() {
+        return mMemoryTable[REG_ID];
+    }
 
     void handleByte(uint8_t byte)
     {
@@ -257,7 +323,7 @@ public:
 
     void checkCommand()
     {
-        if (mActiveId != mMyId && mActiveId != 0xFE)
+        if (mActiveId != myID() && mActiveId != 0xFE)
         {
             // Serial.printf("Ignoring command for ID 0x%02X\n", mCctiveId);
             return;
@@ -320,7 +386,7 @@ public:
         uint8_t rawData[length + 6];
         rawData[0] = 0xFF;
         rawData[1] = 0xFF;
-        rawData[2] = mMyId;
+        rawData[2] = myID();
         rawData[3] = length + 2; // length
         rawData[4] = 0;          // status ok
 
@@ -422,7 +488,7 @@ public:
         for (size_t i = 0; i < numServos; ++i)
         {
             const size_t servo_id = payload[3 + i];
-            if (servo_id == mMyId)
+            if (servo_id == myID())
             {
                 my_servo_position = i;
                 // Handle reading from this servo as needed
@@ -571,34 +637,41 @@ public:
 
     void doLoop(int targetPosition)
     {
-        const int currentPosition = encoderStepCount / ENCODER_STEP_PER_UNIT;
-        const int error = targetPosition - currentPosition;
+        const int targetCount = targetPosition * ENCODER_STEP_PER_UNIT;
+        const int currentCount = encoderStepCount;
+        const float error = targetCount - currentCount;
 
-        if (abs(error) < 20)
+        if (abs(error) < 200)
         {
             setMotorSpeed(0);
             return; // within deadband
         }
 
         // Simple P controller
-        const int Kp = 5; // Proportional gain
-        int controlSignal = Kp * error;
+        const float Kp = 5.0f/12; // Proportional gain
+        const float controlSignal = Kp * error;
+        const int pwm = pwmFromControlSignal(controlSignal);
+        setMotorSpeed(pwm);
+    }
 
+    int pwmFromControlSignal(float controlSignal)
+    {   
+        const int pwm = static_cast<int>(controlSignal);
         // Clamp control signal to motor speed limits
-        if (controlSignal > maxSpeed)
+        if (pwm > maxSpeed)
         {
-            controlSignal = maxSpeed;
+            return maxSpeed;
         }
-        else if (controlSignal < -maxSpeed)
+        else if (pwm < -maxSpeed)
         {
-            controlSignal = -maxSpeed;
+            return -maxSpeed;
         }
-        else if (abs(controlSignal) < 50)
+        else if (abs(pwm) < 50)
         {
-            controlSignal = 0; // deadband
+            return 0; // deadband
         }
 
-        setMotorSpeed(controlSignal);
+        return pwm;
     }
 
     void applySetpointFromEncoder()
@@ -685,6 +758,17 @@ void saveEncoderStepCountToFram()
     }
 }
 
+void checkWriteEeprom()
+{
+    static uint8_t lastLock = 1;
+    const auto lock = st3215Handler.mMemoryTable[REG_LOCK];
+    if (lock != lastLock && lock == 1) // lock activated
+    {
+        st3215Handler.writeEEPROM();
+    }
+    lastLock = lock;
+}
+
 void setup()
 {
     delay(2000);
@@ -757,4 +841,6 @@ void loop()
     st3215Handler.mMemoryTable[REG_POSITION_L] = step & 0xFF;
 
     saveEncoderStepCountToFram();
+
+    checkWriteEeprom();
 }
