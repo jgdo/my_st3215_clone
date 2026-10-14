@@ -4,6 +4,7 @@
 #include <EEPROM.h>
 #include <atomic>
 #include <cstring>
+#include <optional>
 
 long previousMillis = 0;
 
@@ -13,6 +14,8 @@ long previousMillis = 0;
 #define MAX_PHYSICAL_POSITION 3730
 
 #define ENCODER_STEP_PER_UNIT 12
+
+#define MOTOR_CONTROL_INTERVAL_MS 10
 
 std::atomic<int32_t> encoderStepCount = 2048 * ENCODER_STEP_PER_UNIT; // Global step count for quadrature encoder
 int32_t framEncoderStepCount = 0;
@@ -92,6 +95,9 @@ enum State
 #define REG_D_GAIN 0x16
 #define REG_I_GAIN 0x17
 
+#define REG_CW_DEAD_BAND 26
+#define REG_CCW_DEAD_BAND 27
+
 #define REG_TARGET_POSITION_L 0x2A
 #define REG_TARGET_POSITION_H 0x2B
 #define REG_OPERATION_TIME_L 0x2C
@@ -134,8 +140,9 @@ class ST3215Handler
     static constexpr size_t FIRST_EEPROM_REG = 5;
     static constexpr size_t LAST_EEPROM_REG = 39;
     static constexpr size_t EEPROM_REG_COUNT = LAST_EEPROM_REG - FIRST_EEPROM_REG + 1;
-    static constexpr uint32_t EEPROM_CRC_ADDR = 0; 
+    static constexpr uint32_t EEPROM_CRC_ADDR = 0;
     static_assert(FIRST_EEPROM_REG > 0, "FIRST_EEPROM_REG must not start at 0 because EEPROM_CRC_ADDR is at 0");
+
 public:
     ST3215Handler()
     {
@@ -145,20 +152,25 @@ public:
         mMemoryTable[REG_SERVO_MAIN_VERSION] = 9;
         mMemoryTable[REG_SERVO_SUB_VERSION] = 3;
         mMemoryTable[REG_ID] = INITIAL_SERVO_ID;
-        
+
         // EEPROM default values
         mMemoryTable[REG_BAUD_RATE] = 1; // 500Kbps
         mMemoryTable[REG_LOCK] = 1;
+        mMemoryTable[REG_CW_DEAD_BAND] = 1;
+        mMemoryTable[REG_CCW_DEAD_BAND] = 1;
+        mMemoryTable[REG_P_GAIN] = 90;
+        mMemoryTable[REG_I_GAIN] = 10;
+        mMemoryTable[REG_D_GAIN] = 30;
 
         // will be set to current position later
         mMemoryTable[REG_TARGET_POSITION_L] = 0;
         mMemoryTable[REG_TARGET_POSITION_H] = 8;
-
-        loadEEPROM();
     }
 
     void begin()
     {
+        loadEEPROM();
+
         Serial3.setHalfDuplex();
         Serial3.begin(500000);
         Serial3.enableHalfDuplexRx();
@@ -255,6 +267,12 @@ public:
         Serial.println("Loaded EEPROM values successfully.");
     }
 
+    int cwDeadBand() const { return mMemoryTable[REG_CW_DEAD_BAND]; }
+    int ccwDeadBand() const { return mMemoryTable[REG_CCW_DEAD_BAND]; }
+    int kp() const { return mMemoryTable[REG_P_GAIN]; }
+    int ki() const { return mMemoryTable[REG_I_GAIN]; }
+    int kd() const { return mMemoryTable[REG_D_GAIN]; }
+
     // private:
     State state = WAITING_FIRST_FF;
     int mActiveId = -1;
@@ -267,7 +285,8 @@ public:
     uint32_t mReadSyncTransmissionDelay_us = 0;
     uint32_t mReadSyncTransmissionTime_us = 0;
 
-    auto myID() {
+    auto myID()
+    {
         return mMemoryTable[REG_ID];
     }
 
@@ -625,6 +644,8 @@ class MotorController
 {
 public:
     const int maxSpeed = 255;
+    std::optional<uint32_t> lastUpdateMicros = std::nullopt;
+    std::optional<int32_t> lastCount = std::nullopt;
 
     void begin()
     {
@@ -639,23 +660,50 @@ public:
     {
         const int targetCount = targetPosition * ENCODER_STEP_PER_UNIT;
         const int currentCount = encoderStepCount;
-        const float error = targetCount - currentCount;
+        const float posError = targetCount - currentCount;
 
-        if (abs(error) < 200)
+        const uint32_t currentMicros = micros();
+        const float dt = lastUpdateMicros.has_value() ? (currentMicros - lastUpdateMicros.value()) * 1e-6f : MOTOR_CONTROL_INTERVAL_MS * 1e-3f;
+        lastUpdateMicros = currentMicros;
+
+        const float vel = lastCount.has_value() ? (currentCount - lastCount.value()) / static_cast<float>(ENCODER_STEP_PER_UNIT) / dt : 0.0f;
+        lastCount = currentCount;
+
+        const int cwDeadBand = st3215Handler.cwDeadBand() * ENCODER_STEP_PER_UNIT;
+        const int ccwDeadBand = st3215Handler.ccwDeadBand() * ENCODER_STEP_PER_UNIT;
+
+        if (posError > -ccwDeadBand && posError < cwDeadBand)
         {
             setMotorSpeed(0);
             return; // within deadband
         }
 
-        // Simple P controller
-        const float Kp = 5.0f/12; // Proportional gain
-        const float controlSignal = Kp * error;
+        const float Kp = st3215Handler.kp() / static_cast<float>(ENCODER_STEP_PER_UNIT);
+        const float Ki = st3215Handler.ki() / static_cast<float>(ENCODER_STEP_PER_UNIT);
+        const float Kd = st3215Handler.kd() / static_cast<float>(ENCODER_STEP_PER_UNIT);
+
+        // PID controller
+        static float integral = 0.0f;
+        static float previousError = 0.0f;
+
+        const float integralIncrease = posError * dt;
+        integral += integralIncrease;
+        const float derivative = (posError - previousError) / dt;
+        previousError = posError;
+
+        const float controlSignal = Kp * posError + Ki * integral + Kd * derivative;
         const int pwm = pwmFromControlSignal(controlSignal);
+        if (pwm == maxSpeed || pwm == -maxSpeed)
+        {
+            // Motor is saturated
+            integral -= integralIncrease; // Anti-windup: revert the last integral increase
+        }
+
         setMotorSpeed(pwm);
     }
 
     int pwmFromControlSignal(float controlSignal)
-    {   
+    {
         const int pwm = static_cast<int>(controlSignal);
         // Clamp control signal to motor speed limits
         if (pwm > maxSpeed)
@@ -826,7 +874,7 @@ void loop()
         setMotorSpeed(200);
         motor.applySetpointFromEncoder();
     }
-    else if (ms - lastMs >= 10 || setpointPos != lastSetpointPos)
+    else if (ms - lastMs >= MOTOR_CONTROL_INTERVAL_MS || setpointPos != lastSetpointPos)
     {
         lastMs = ms;
         lastSetpointPos = setpointPos;
