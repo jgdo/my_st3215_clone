@@ -244,7 +244,10 @@ public:
         if (changed)
         {
             eeprom_buffer_flush();
-            Serial.println("Written memory to EEPROM");
+            Serial.print("Written memory to EEPROM, checksum is ");
+            Serial.println(checksum);
+
+            loadEEPROM();
         }
     }
 
@@ -264,7 +267,8 @@ public:
         }
 
         std::memcpy(&mMemoryTable[FIRST_EEPROM_REG], stored, EEPROM_REG_COUNT);
-        Serial.println("Loaded EEPROM values successfully.");
+        Serial.print("Loaded EEPROM values successfully. Checksum is ");
+        Serial.println(eeprom_buffered_read_byte(EEPROM_CRC_ADDR));
     }
 
     int cwDeadBand() const { return mMemoryTable[REG_CW_DEAD_BAND]; }
@@ -383,6 +387,9 @@ public:
             break;
         case INST_SYNC_READ: // sync read
             handleSyncRead();
+            break;
+        case INST_SYNC_WRITE: // sync write
+            handleSyncWrite();
             break;
 
         default:
@@ -546,6 +553,33 @@ public:
         state = WAIT_FOR_READ_SYNC_TRANSMISSION_TIME;
 
         // Serial.printf("Sync read of %d bytes, own id at position %d, transmission delay will be: %u us, state: %d\n", numReadBytes, my_servo_position, mReadSyncTransmissionDelay_us, state);
+    }
+
+    void handleSyncWrite()
+    {
+        const size_t addr = payload[1];
+        const size_t num_bytes = payload[2];
+
+        if (addr + num_bytes > mMemoryTable.size())
+        {
+            Serial.println("Sync write request out of bounds.");
+            return;
+        }
+
+        const size_t nServos = (mPayloadLength - 4) / (num_bytes + 1); // 4 bytes are {inst, addr, num, checksum}, plus 1 byte per servo ID
+
+        for (size_t i = 0; i < nServos; ++i)
+        {
+            const size_t segmentStart = 3 + i * (num_bytes + 1);
+            const size_t servo_id = payload[segmentStart];
+            if (servo_id == myID())
+            {
+                memcpy(&mMemoryTable[addr], &payload[segmentStart + 1], num_bytes);
+                break;
+            }
+        }
+
+        // no response for sync write!
     }
 
     std::array<uint8_t, 71> mMemoryTable;
